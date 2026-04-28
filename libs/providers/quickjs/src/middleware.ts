@@ -4,8 +4,7 @@
  * Provides a `js_eval` tool that runs JavaScript in a WASM-sandboxed QuickJS
  * interpreter. Supports:
  * - Persistent state across evaluations (true REPL)
- * - VFS integration via readFile/writeFile
- * - Programmatic tool calling (PTC)
+ * - Programmatic tool calling (PTC) — expose agent or custom tools inside the REPL
  */
 
 import {
@@ -15,7 +14,6 @@ import {
 } from "langchain";
 import { z } from "zod/v4";
 import type { StructuredToolInterface } from "@langchain/core/tools";
-import { StateBackend, type BackendRuntime, resolveBackend } from "deepagents";
 
 import dedent from "dedent";
 import type { QuickJSMiddlewareOptions } from "./types.js";
@@ -42,25 +40,7 @@ import {
 import type * as _zodTypes from "@langchain/core/utils/types";
 import type * as _zodMeta from "@langchain/langgraph/zod";
 import type * as _messages from "@langchain/core/messages";
-import {
-  getCurrentTaskInput,
-  LangGraphRunnableConfig,
-} from "@langchain/langgraph";
-
-/**
- * Backend-provided tools excluded from PTC by default.
- * These are redundant inside the REPL since VFS helpers (readFile/writeFile)
- * already cover file I/O against the agent's in-memory working set.
- */
-export const DEFAULT_PTC_EXCLUDED_TOOLS = [
-  "ls",
-  "read_file",
-  "write_file",
-  "edit_file",
-  "glob",
-  "grep",
-  "execute",
-] as const;
+import { LangGraphRunnableConfig } from "@langchain/langgraph";
 
 const REPL_SYSTEM_PROMPT = dedent`
   ## TypeScript/JavaScript REPL (\`js_eval\`)
@@ -71,36 +51,10 @@ const REPL_SYSTEM_PROMPT = dedent`
 
   ### Hard rules
 
-  - **No network, no filesystem** — only the helpers below. Do not attempt \`fetch\`, \`require\`, or \`import\`.
+  - **No network, no direct filesystem** — only through tools provided in the \`tools\` namespace below.
   - **Cite your sources** — when reporting values from files, include the path and key/index so the user can verify.
   - **Use console.log()** for output — it is captured and returned. \`console.warn()\` and \`console.error()\` are also available.
   - **Reuse state from previous cells** — variables, functions, and results from earlier \`js_eval\` calls persist across calls. Reference them by name in follow-up cells instead of re-embedding data as inline JSON literals.
-
-  ### First-time usage
-
-  \`\`\`typescript
-  // Read a file from the agent's virtual filesystem
-  const raw: string = await readFile("/data.json");
-  const data = JSON.parse(raw) as { n: number };
-  console.log(data);
-
-  // Write results back
-  await writeFile("/output.txt", JSON.stringify({ result: data.n }));
-  \`\`\`
-
-  ### API Reference — built-in globals
-
-  \`\`\`typescript
-  /**
-   * Read a file from the agent's virtual filesystem. Throws if the file does not exist.
-   */
-  async readFile(path: string): Promise<string>
-
-  /**
-   * Write a file to the agent's virtual filesystem.
-   */
-  async writeFile(path: string, content: string): Promise<void>
-  \`\`\`
 
   ### Limitations
 
@@ -157,21 +111,39 @@ export async function generatePtcPrompt(
 }
 
 /**
+ * Resolves a mixed list of tool names and tool instances into a flat list of
+ * StructuredToolInterface objects. Strings are looked up by name in agentTools;
+ * instances are included directly without requiring agent registration. Strings
+ * that don't match any agent tool are silently omitted.
+ */
+export function resolveToolList(
+  items: (string | StructuredToolInterface)[],
+  agentTools: StructuredToolInterface[],
+): StructuredToolInterface[] {
+  const agentByName = new Map(agentTools.map((t) => [t.name, t]));
+  return items.flatMap((item) => {
+    if (typeof item === "string") {
+      const found = agentByName.get(item);
+      return found ? [found] : [];
+    }
+    return [item];
+  });
+}
+
+/**
  * Create the QuickJS REPL middleware.
  */
 export function createQuickJSMiddleware(
   options: QuickJSMiddlewareOptions = {},
 ) {
   const {
-    backend = (runtime: BackendRuntime) => new StateBackend(runtime),
-    ptc = false,
+    ptc,
     memoryLimitBytes = DEFAULT_MEMORY_LIMIT,
     maxStackSizeBytes = DEFAULT_MAX_STACK_SIZE,
     executionTimeoutMs = DEFAULT_EXECUTION_TIMEOUT,
     systemPrompt: customSystemPrompt = null,
   } = options;
 
-  const usePtc = ptc !== false;
   const baseSystemPrompt = customSystemPrompt || REPL_SYSTEM_PROMPT;
 
   const middlewareId = crypto.randomUUID();
@@ -183,31 +155,11 @@ export function createQuickJSMiddleware(
   function filterToolsForPtc(
     allTools: StructuredToolInterface[],
   ): StructuredToolInterface[] {
-    if (ptc === false) return [];
+    if (!ptc) return [];
 
     const candidates = allTools.filter((t) => t.name !== "js_eval");
 
-    if (ptc === true) {
-      const excluded = new Set<string>(DEFAULT_PTC_EXCLUDED_TOOLS);
-      return candidates.filter((t) => !excluded.has(t.name));
-    }
-
-    if (Array.isArray(ptc)) {
-      const included = new Set(ptc);
-      return candidates.filter((t) => included.has(t.name));
-    }
-
-    if ("include" in ptc) {
-      const included = new Set(ptc.include);
-      return candidates.filter((t) => included.has(t.name));
-    }
-
-    if ("exclude" in ptc) {
-      const excluded = new Set([...DEFAULT_PTC_EXCLUDED_TOOLS, ...ptc.exclude]);
-      return candidates.filter((t) => !excluded.has(t.name));
-    }
-
-    return [];
+    return resolveToolList(ptc, candidates);
   }
 
   const jsEvalTool = tool(
@@ -215,30 +167,21 @@ export function createQuickJSMiddleware(
       const threadId = config.configurable?.thread_id || DEFAULT_SESSION_ID;
       const sessionKey = `${threadId}:${middlewareId}`;
 
-      const runtime: BackendRuntime = {
-        ...config,
-        state: getCurrentTaskInput(config) || {},
-      } as BackendRuntime;
-      const resolvedBackend = await resolveBackend(backend, runtime);
-
       const session = ReplSession.getOrCreate(sessionKey, {
         memoryLimitBytes,
         maxStackSizeBytes,
-        backend: resolvedBackend,
         tools: ptcTools,
       });
 
       const result = await session.eval(input.code, executionTimeoutMs);
-      await session.flushWrites(resolvedBackend);
-
       return formatReplResult(result);
     },
     {
       name: "js_eval",
       description: dedent`
         Evaluate TypeScript/JavaScript code in a sandboxed REPL. State persists across calls.
-        Use readFile(path) and writeFile(path, content) for file access.
         Use console.log() for output. Returns the result of the last expression.
+        If file or other tools are available, call them via the tools namespace: await tools.readFile({ path }).
       `,
       schema: z.object({
         code: z
@@ -255,7 +198,7 @@ export function createQuickJSMiddleware(
     tools: [jsEvalTool],
     wrapModelCall: async (request, handler) => {
       const agentTools = (request.tools || []) as StructuredToolInterface[];
-      ptcTools = usePtc ? filterToolsForPtc(agentTools) : [];
+      ptcTools = filterToolsForPtc(agentTools);
 
       if (ptcTools.length > 0 && !cachedPtcPrompt) {
         cachedPtcPrompt = await generatePtcPrompt(ptcTools);
