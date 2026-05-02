@@ -284,6 +284,41 @@ describe("createSummarizationMiddleware", () => {
       expect(isCommand(result)).toBe(false);
     });
 
+    it("should respect user-provided absolute trigger when model has no profile (#467)", async () => {
+      const mockBackend = createMockBackend();
+
+      const mockModelWithoutProfile = {
+        async invoke(_messages: any) {
+          return {
+            content: "This is a summary of the conversation.",
+          };
+        },
+      };
+
+      const middleware = createSummarizationMiddleware({
+        model: mockModelWithoutProfile as any,
+        backend: mockBackend,
+        trigger: { type: "tokens", value: 100 },
+        keep: { type: "messages", value: 2 },
+      });
+
+      const messages = Array.from(
+        { length: 10 },
+        (_, i) =>
+          new HumanMessage({
+            content: `Message ${i} with extra content to bump token count`,
+          }),
+      );
+
+      const { result, capturedRequest } = await callWrapModelCall(middleware, {
+        messages,
+      });
+
+      expect(isCommand(result)).toBe(true);
+      expect(capturedRequest).not.toBeNull();
+      expect(capturedRequest!.messages).toHaveLength(3);
+    });
+
     it("should not trigger when token count is below fraction threshold", async () => {
       const mockBackend = createMockBackend();
 

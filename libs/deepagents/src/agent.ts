@@ -177,6 +177,7 @@ export function createDeepAgent<
     memory,
     skills,
     permissions = [],
+    summarization,
   } = params;
 
   const collidingTools = tools
@@ -226,7 +227,12 @@ export function createDeepAgent<
       // Automatically summarizes conversation history when token limits are approached.
       // Uses createSummarizationMiddleware (deepagents version) with backend support
       // and auto-computed defaults from model profile.
-      createSummarizationMiddleware({ backend }),
+      // User overrides from `params.summarization` take precedence.
+      createSummarizationMiddleware({
+        ...(summarization ?? {}),
+        model: summarization?.model ?? model,
+        backend,
+      }),
       // Patches tool calls to ensure compatibility across different model providers.
       createPatchToolCallsMiddleware(),
       // Loads subagent-specific skills when configured.
@@ -300,7 +306,12 @@ export function createDeepAgent<
     // Automatically summarizes conversation history when token limits are approached.
     // Uses createSummarizationMiddleware (deepagents version) with backend support
     // for conversation history offloading and auto-computed defaults from model profile.
-    createSummarizationMiddleware({ backend }),
+    // User overrides from `params.summarization` take precedence.
+    createSummarizationMiddleware({
+      ...(summarization ?? {}),
+      model: summarization?.model ?? model,
+      backend,
+    }),
     // Patches tool calls to ensure compatibility across different model providers.
     createPatchToolCallsMiddleware(),
   ] as const;

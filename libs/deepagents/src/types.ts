@@ -24,6 +24,7 @@ import type {
 
 import type { AnyBackendProtocol } from "./backends/index.js";
 import type { AsyncSubAgent, SubAgent } from "./middleware/index.js";
+import type { SummarizationMiddlewareOptions } from "./middleware/summarization.js";
 import type { InteropZodObject } from "@langchain/core/utils/types";
 import type { AnnotationRoot } from "@langchain/langgraph";
 import type { CompiledSubAgent } from "./middleware/subagents.js";
@@ -456,4 +457,42 @@ export interface CreateDeepAgentParams<
    * ```
    */
   permissions?: FilesystemPermission[];
+  /**
+   * Optional overrides for the built-in summarization middleware.
+   *
+   * When omitted, summarization defaults are computed from the model's profile:
+   * - Models with `profile.maxInputTokens` (e.g., OpenAI, Anthropic) use
+   *   fraction-based defaults (`trigger=0.85`, `keep=0.10`).
+   * - Models without a profile (e.g., many non-OpenAI providers) fall back to
+   *   a fixed `170_000` token trigger, which is high enough that summarization
+   *   may never run in practice.
+   *
+   * Pass options here to override `trigger`, `keep`, `summaryPrompt`, or any
+   * other summarization setting. The agent's `model` and `backend` are used
+   * automatically when not specified, so the most common usage is to set
+   * `trigger` and `keep` only.
+   *
+   * @example
+   * ```typescript
+   * createDeepAgent({
+   *   model: "qwen-plus", // no profile.maxInputTokens
+   *   summarization: {
+   *     trigger: { type: "tokens", value: 16000 },
+   *     keep: { type: "messages", value: 6 },
+   *   },
+   * });
+   * ```
+   *
+   * @example Use a cheaper model for summarization than the agent itself
+   * ```typescript
+   * createDeepAgent({
+   *   model: "claude-sonnet-4-5-20250929",
+   *   summarization: {
+   *     model: "claude-haiku-4-5-20251001",
+   *     trigger: { type: "fraction", value: 0.7 },
+   *   },
+   * });
+   * ```
+   */
+  summarization?: Partial<Omit<SummarizationMiddlewareOptions, "backend">>;
 }
